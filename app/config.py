@@ -28,6 +28,12 @@ class Settings:
     lease_seconds: int = _get_int("LEASE_SECONDS", 30)
     http_timeout_seconds: float = _get_float("HTTP_TIMEOUT_SECONDS", 10)
     worker_poll_seconds: float = _get_float("WORKER_POLL_SECONDS", 1)
+    # 已撤销事件的滞留投递清理巡检间隔（秒）：撤销时为 pending/在途的投递，
+    # 其租约过期后若所在订阅被暂停或停用，认领路径（claim_delivery）不会再
+    # 访问到它们，改由该后台清理直接转终态 cancelled（无需认领、不发新租约）。
+    cancel_sweep_interval_seconds: float = _get_float(
+        "CANCEL_SWEEP_INTERVAL_SECONDS", 1
+    )
     # 失败策略：共尝试 max_attempts 次；第 n 次失败后等待 base*2^(n-1)（封顶 cap）
     max_attempts: int = _get_int("MAX_ATTEMPTS", 6)
     backoff_base_seconds: float = _get_float("BACKOFF_BASE_SECONDS", 5)

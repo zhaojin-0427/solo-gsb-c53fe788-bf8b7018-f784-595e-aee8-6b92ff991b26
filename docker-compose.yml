@@ -49,6 +49,9 @@ services:
       MAX_ATTEMPTS: ${MAX_ATTEMPTS:-6}
       BACKOFF_BASE_SECONDS: ${BACKOFF_BASE_SECONDS:-5}
       BACKOFF_CAP_SECONDS: ${BACKOFF_CAP_SECONDS:-300}
+      # 撤销滞留投递后台清理巡检间隔（秒）：暂停/停用订阅下租约过期的已撤销
+      # 在途投递无需认领即转终态 cancelled（取消请求返回后也会立即清理一次）
+      CANCEL_SWEEP_INTERVAL_SECONDS: ${CANCEL_SWEEP_INTERVAL_SECONDS:-1}
       # 出站安全策略：默认阻止回环/私网/链路本地/组播/云元数据地址；
       # 显式放行 compose 网络内的 receiver 主机名（可用 .env 覆盖追加）
       WEBHOOK_ALLOWED_HOSTS: ${WEBHOOK_ALLOWED_HOSTS:-receiver}

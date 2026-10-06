@@ -315,6 +315,13 @@ async def run() -> None:
         try:
             while not stop.is_set():
                 try:
+                    # 先做一次“无需认领”的撤销滞留清理：暂停/停用订阅下
+                    # 租约已过期、事件已撤销的 in_flight 投递不会再被认领，
+                    # 直接转 cancelled（不产生租约、不新增尝试）。
+                    async with pool.acquire() as conn:
+                        swept = await repo.sweep_cancelled_deliveries(conn)
+                    if swept:
+                        log.info("清理了 %s 条撤销滞留投递（转 cancelled）", swept)
                     handled = await handle_one(pool, client, payload_store)
                 except Exception:  # noqa: BLE001 - Worker 主循环不能因单任务退出
                     log.exception("处理投递时发生未预期错误")

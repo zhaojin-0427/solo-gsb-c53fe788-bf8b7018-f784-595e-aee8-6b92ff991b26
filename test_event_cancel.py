@@ -34,6 +34,7 @@ COMMON_ENV = {
     "LEASE_SECONDS": "30",
     "HTTP_TIMEOUT_SECONDS": "5",
     "WORKER_POLL_SECONDS": "0.1",
+    "CANCEL_SWEEP_INTERVAL_SECONDS": "0.2",
     "MAX_ATTEMPTS": "6",
     "BACKOFF_BASE_SECONDS": "1",
     "BACKOFF_CAP_SECONDS": "8",
@@ -221,6 +222,207 @@ async def _db_interleaving_tests(dsn: str) -> None:
     check(
         "交错4: 过期 in_flight 经接管复核转 cancelled",
         await conn.fetchval("SELECT status FROM deliveries WHERE id=$1", did4)
+        == "cancelled",
+    )
+
+    # ---- 滞留投递的“无需认领”清理（sweep_cancelled_deliveries）----
+    # 场景 A（本 bug 核心）：订阅暂停，撤销时投递是租约已过期的 in_flight。
+    # claim_delivery 过滤 paused=TRUE，永远认领不到；清理直接转 cancelled。
+    eidS, sidS, didS = await _seed(
+        conn, "cancel-sweep-paused", status="in_flight",
+        lease="dead-worker", lease_age_seconds=60.0,
+    )
+    await conn.execute(
+        "UPDATE subscriptions SET paused=TRUE, paused_at=now() WHERE id=$1", sidS
+    )
+    await repo.cancel_event(conn, eidS)
+    # 撤销本身只终结 pending：过期 in_flight 仍滞留
+    check(
+        "清理A: 撤销不直接翻转过期 in_flight（暂停订阅仍滞留 in_flight）",
+        await conn.fetchval("SELECT status FROM deliveries WHERE id=$1", didS)
+        == "in_flight",
+    )
+    check(
+        "清理A: 暂停订阅认领不到任何投递（旧路径会永久滞留）",
+        await repo.claim_delivery(conn, "probe-sweep") is None,
+    )
+    now_s = datetime.now(timezone.utc)
+    n_s = await repo.sweep_cancelled_deliveries(conn, now=now_s, event_pk=eidS)
+    row_s = await conn.fetchrow(
+        "SELECT status, leased_by, lease_expires_at, attempts_made FROM deliveries WHERE id=$1",
+        didS,
+    )
+    check(
+        "清理A: 无需认领，暂停订阅过期在途投递转 cancelled 且清除租约",
+        n_s == 1 and row_s["status"] == "cancelled"
+        and row_s["leased_by"] is None and row_s["lease_expires_at"] is None,
+        str(dict(row_s)),
+    )
+    check("清理A: 清理不新增尝试", row_s["attempts_made"] == 0)
+    # 重复清理幂等：命中 0 行、不新增尝试
+    n_s2 = await repo.sweep_cancelled_deliveries(conn, now=now_s, event_pk=eidS)
+    row_s2 = await conn.fetchrow(
+        "SELECT status, attempts_made FROM deliveries WHERE id=$1", didS
+    )
+    check(
+        "清理A: 重复清理命中 0 行且终态/尝试数不变",
+        n_s2 == 0 and row_s2["status"] == "cancelled" and row_s2["attempts_made"] == 0,
+    )
+
+    # 场景 B：订阅停用（active=FALSE）同样永不可认领，清理照样终结。
+    eidA, sidA, didA = await _seed(
+        conn, "cancel-sweep-inactive", status="in_flight",
+        lease="dead-worker", lease_age_seconds=90.0,
+    )
+    await conn.execute(
+        "UPDATE subscriptions SET active=FALSE WHERE id=$1", sidA
+    )
+    await repo.cancel_event(conn, eidA)
+    check("清理B: 停用订阅认领不到", await repo.claim_delivery(conn, "probe-sweep-b") is None)
+    n_a = await repo.sweep_cancelled_deliveries(
+        conn, now=datetime.now(timezone.utc), event_pk=eidA
+    )
+    check(
+        "清理B: 停用订阅过期在途投递也直接转 cancelled",
+        n_a == 1
+        and await conn.fetchval("SELECT status FROM deliveries WHERE id=$1", didA)
+        == "cancelled",
+    )
+
+    # 场景 C：未过期的在途请求绝不能被清理——保留 in_flight 让其飞完。
+    eidL, sidL, didL = await _seed(
+        conn, "cancel-sweep-live", status="in_flight",
+        lease="live-worker", lease_age_seconds=5.0,  # 租约 30s，仅过去 5s
+    )
+    await repo.cancel_event(conn, eidL)
+    n_l = await repo.sweep_cancelled_deliveries(
+        conn, now=datetime.now(timezone.utc), event_pk=eidL
+    )
+    live_row = await conn.fetchrow(
+        "SELECT status, leased_by FROM deliveries WHERE id=$1", didL
+    )
+    check(
+        "清理C: 未过期在途投递不被清理（仍 in_flight、租约保留）",
+        n_l == 0 and live_row["status"] == "in_flight"
+        and live_row["leased_by"] == "live-worker",
+        str(dict(live_row)),
+    )
+    # 该在途请求成功：仍记 succeeded（撤销允许撤销前已认领请求完成）
+    settled_l = await repo.settle_delivery(
+        conn, delivery_id=didL, lease_token="live-worker",
+        succeeded=True, not_before=None, max_attempts=6,
+    )
+    check("清理C: 未过期在途请求成功仍记 succeeded", settled_l == "succeeded")
+    # 成功后清理绝不覆盖终态
+    n_l2 = await repo.sweep_cancelled_deliveries(conn, event_pk=eidL)
+    check(
+        "清理C: 成功终态不被清理覆盖",
+        n_l2 == 0
+        and await conn.fetchval("SELECT status FROM deliveries WHERE id=$1", didL)
+        == "succeeded",
+    )
+
+    # 场景 D：清理后旧租约令牌迟到回写 —— record_attempt/settle 都必须作废，
+    # 不追加尝试、不覆盖终态。
+    eidD, sidD, didD = await _seed(
+        conn, "cancel-sweep-fence", status="in_flight",
+        lease="zombie-worker", lease_age_seconds=120.0,
+    )
+    await conn.execute(
+        "UPDATE subscriptions SET paused=TRUE, paused_at=now() WHERE id=$1", sidD
+    )
+    await repo.cancel_event(conn, eidD)
+    await repo.sweep_cancelled_deliveries(conn, event_pk=eidD)
+    check(
+        "清理D: 清理已转 cancelled",
+        await conn.fetchval("SELECT status FROM deliveries WHERE id=$1", didD)
+        == "cancelled",
+    )
+    att = await repo.record_attempt(
+        conn, delivery_id=didD, lease_token="zombie-worker", worker_id="zombie-worker",
+        outcome="success", http_status=200, response_excerpt=None,
+        error_message=None, leased_at=datetime.now(timezone.utc),
+        lease_expires_at=datetime.now(timezone.utc) + timedelta(seconds=30),
+    )
+    n_attempts = await conn.fetchval(
+        "SELECT COUNT(*) FROM delivery_attempts WHERE delivery_id=$1", didD
+    )
+    check(
+        "清理D: 旧租约 record_attempt 被拒（返回 None、不新增尝试）",
+        att is None and n_attempts == 0,
+        f"att={att}, attempts={n_attempts}",
+    )
+    st = await repo.settle_delivery(
+        conn, delivery_id=didD, lease_token="zombie-worker",
+        succeeded=True, not_before=None, max_attempts=6,
+    )
+    check(
+        "清理D: 旧租约 settle 被拒且终态保持 cancelled",
+        st is None
+        and await conn.fetchval("SELECT status FROM deliveries WHERE id=$1", didD)
+        == "cancelled",
+    )
+
+    # 场景 E：全库巡检（不带 event_pk）跨事件清理，且不动未撤销事件。
+    eidE1, _sidE1, didE1 = await _seed(
+        conn, "cancel-sweep-global-1", status="in_flight",
+        lease="dead-worker", lease_age_seconds=60.0,
+    )
+    eidE2, _sidE2, didE2 = await _seed(
+        conn, "cancel-sweep-global-2", status="in_flight",
+        lease="dead-worker", lease_age_seconds=60.0,
+    )
+    # 一个未撤销事件的过期 in_flight 绝不能被清理（正常等待接管）
+    await repo.cancel_event(conn, eidE1)
+    n_all = await repo.sweep_cancelled_deliveries(conn)
+    check(
+        "清理E: 全库巡检只清理已撤销事件（E1 cancelled，未撤销 E2 保持 in_flight）",
+        n_all >= 1
+        and await conn.fetchval("SELECT status FROM deliveries WHERE id=$1", didE1)
+        == "cancelled"
+        and await conn.fetchval("SELECT status FROM deliveries WHERE id=$1", didE2)
+        == "in_flight",
+        f"n={n_all}",
+    )
+    # 终结未撤销的 E2（撤销+清理），避免其过期 in_flight 作为全局最小 seq
+    # 候选干扰后续交错用例的认领顺序断言。
+    await repo.cancel_event(conn, eidE2)
+    await repo.sweep_cancelled_deliveries(conn, event_pk=eidE2)
+
+    # 场景 F：清理与 record_attempt 事务交错——清理 SKIP LOCKED 正被结算
+    # 持锁的行，不阻塞；下一轮清理再终结。
+    eidF, sidF, didF = await _seed(
+        conn, "cancel-sweep-interleave", status="in_flight",
+        lease="dead-worker", lease_age_seconds=60.0,
+    )
+    await conn.execute(
+        "UPDATE subscriptions SET paused=TRUE, paused_at=now() WHERE id=$1", sidF
+    )
+    await repo.cancel_event(conn, eidF)
+    tx = conn.transaction()
+    await tx.start()
+    # 另一事务持有该投递行锁（模拟 record_attempt/settle 持锁）
+    await conn.execute(
+        "SELECT id FROM deliveries WHERE id=$1 FOR UPDATE", didF
+    )
+    other_f = await asyncpg.connect(dsn)
+    await other_f.set_type_codec(
+        "jsonb", encoder=json.dumps, decoder=json.loads, schema="pg_catalog"
+    )
+    n_f = await repo.sweep_cancelled_deliveries(other_f, event_pk=eidF)
+    check(
+        "清理F: 正被持锁的行被 SKIP LOCKED 跳过（清理不阻塞、命中 0）",
+        n_f == 0
+        and await conn.fetchval("SELECT status FROM deliveries WHERE id=$1", didF)
+        == "in_flight",
+    )
+    await tx.rollback()
+    await other_f.close()
+    n_f2 = await repo.sweep_cancelled_deliveries(conn, event_pk=eidF)
+    check(
+        "清理F: 锁释放后下一轮清理终结该投递",
+        n_f2 == 1
+        and await conn.fetchval("SELECT status FROM deliveries WHERE id=$1", didF)
         == "cancelled",
     )
 
@@ -589,6 +791,113 @@ def run_http_tests(h: Harness) -> None:
     check("最终终态 cancelled、尝试历史保留",
           final_fd["status"] == "cancelled"
           and len(api.get(f"/api/v1/deliveries/{fd['id']}/attempts").json()) == attempts_n)
+
+    # ---- 滞留 bug 端到端：暂停订阅 + 租约过期的 in_flight + 撤销 ----
+    # 复现：cancel 只终结 pending；claim_delivery 过滤 paused=TRUE 永远读不到
+    # 该标记，过期在途投递旧实现会永久滞留 in_flight。修复后取消请求返回后
+    # 的即时清理 + 后台巡检直接转 cancelled（无需认领、不新增尝试）。
+    import asyncpg as _asyncpg
+
+    async def _set_in_flight(delivery_id: int, leased_by: str, age_seconds: float):
+        c = await _asyncpg.connect(h.dsn)
+        try:
+            await c.execute(
+                """
+                UPDATE deliveries
+                SET status='in_flight', leased_by=$2,
+                    leased_at=now() - make_interval(secs => $3),
+                    lease_expires_at=now() - make_interval(secs => $3)
+                        + interval '30 seconds',
+                    updated_at=now()
+                WHERE id=$1
+                """,
+                delivery_id, leased_by, age_seconds,
+            )
+        finally:
+            await c.close()
+
+    # 场景 1（暂停 + 已过期租约）：取消请求返回即应终态
+    stuck_sub = api.post("/api/v1/subscriptions", json={
+        "source": "orders", "target_url": f"{h.rcv}/receive?stuck=1",
+        "secret": "dev-signing-secret",
+    }).json()
+    api.post(f"/api/v1/subscriptions/{stuck_sub['id']}/pause").raise_for_status()
+    stuck_ev = api.post("/api/v1/events", json={
+        "source": "orders", "event_id": "ord-stuck-expired", "payload": {"z": 1},
+    }).json()
+    stuck_d = wait_for(
+        lambda: next(
+            (d for d in api.get(f"/api/v1/events/{stuck_ev['id']}/deliveries").json()
+             if d["subscription_id"] == stuck_sub["id"]),
+            None,
+        ),
+        "stuck 投递建立",
+    )
+    check("暂停订阅投递初始 pending", stuck_d["status"] == "pending")
+    # 模拟僵死 Worker 留下的过期租约（40s > LEASE_SECONDS 30s）
+    asyncio.run(_set_in_flight(stuck_d["id"], "dead-worker-stuck", 40.0))
+    check(
+        "撤销前投递为过期 in_flight（bug 现场）",
+        api.get(f"/api/v1/deliveries/{stuck_d['id']}").json()["status"] == "in_flight",
+    )
+    cr5 = api.post(f"/api/v1/events/{stuck_ev['id']}/cancel")
+    check("撤销滞留事件 200", cr5.status_code == 200, cr5.text)
+    final_stuck = api.get(f"/api/v1/deliveries/{stuck_d['id']}").json()
+    check(
+        "取消返回后过期滞留投递立即 cancelled、租约清除、无新增尝试",
+        final_stuck["status"] == "cancelled"
+        and final_stuck["leased_by"] is None
+        and final_stuck["lease_expires_at"] is None
+        and final_stuck["attempts_made"] == 0,
+        json.dumps(final_stuck, ensure_ascii=False),
+    )
+    check(
+        "事件投递列表不再滞留 in_flight",
+        all(d["status"] != "in_flight"
+            for d in api.get(f"/api/v1/events/{stuck_ev['id']}/deliveries").json()),
+    )
+    time.sleep(1.0)
+    stuck_hits = [x for x in rcv.get("/received", params={"limit": 200}).json()["items"]
+                  if x["event_id"] == "ord-stuck-expired"]
+    check("滞留投递从未被认领投递（接收器无记录）", len(stuck_hits) == 0,
+          f"hits={len(stuck_hits)}")
+
+    # 场景 2（撤销时租约尚未过期、随后僵死）：即时清理保留 in_flight，
+    # 租约到期后由后台巡检（无需认领）转 cancelled。
+    stuck_sub2 = api.post("/api/v1/subscriptions", json={
+        "source": "orders", "target_url": f"{h.rcv}/receive?stuck=2",
+        "secret": "dev-signing-secret",
+    }).json()
+    api.post(f"/api/v1/subscriptions/{stuck_sub2['id']}/pause").raise_for_status()
+    stuck_ev2 = api.post("/api/v1/events", json={
+        "source": "orders", "event_id": "ord-stuck-expiring", "payload": {"z": 2},
+    }).json()
+    stuck_d2 = next(
+        d for d in api.get(f"/api/v1/events/{stuck_ev2['id']}/deliveries").json()
+        if d["subscription_id"] == stuck_sub2["id"]
+    )
+    # 租约 2s 后才到期（leased 28s 前、30s 租约）
+    asyncio.run(_set_in_flight(stuck_d2["id"], "dead-worker-expiring", 28.0))
+    api.post(f"/api/v1/events/{stuck_ev2['id']}/cancel").raise_for_status()
+    right_after = api.get(f"/api/v1/deliveries/{stuck_d2['id']}").json()
+    check(
+        "撤销时租约未过期：即时清理保留在途请求（仍 in_flight、租约在）",
+        right_after["status"] == "in_flight"
+        and right_after["leased_by"] == "dead-worker-expiring",
+        json.dumps(right_after, ensure_ascii=False),
+    )
+    final2 = wait_for(
+        lambda: (lambda d: d if d["status"] == "cancelled" else None)(
+            api.get(f"/api/v1/deliveries/{stuck_d2['id']}").json()),
+        "租约到期后后台巡检转 cancelled（无需认领）",
+        timeout=8,
+    )
+    check(
+        "后台清理后租约清除且无新增尝试",
+        final2["leased_by"] is None and final2["lease_expires_at"] is None
+        and final2["attempts_made"] == 0,
+        json.dumps(final2, ensure_ascii=False),
+    )
 
     # 其他事件严格顺序：新事件正常送达；已撤销终态不阻挡后续
     good = api.post("/api/v1/events", json={

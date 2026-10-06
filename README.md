@@ -37,8 +37,14 @@
   `cancelled`**。撤销响应成功后 Worker 绝不会再为该事件产生新租约（撤销与
   认领按“事件行 → 订阅行 → 投递行”锁序串行）；撤销前**已认领（in_flight）
   的请求仍可完成**——成功仍记 `succeeded`，失败或租约过期则转 `cancelled`，
-  不再重试、不入死信。撤销后该事件的**死信重放被拒绝（409）**；已有成功、
-  死信、每次尝试历史与载荷对象引用全部保留，**其他事件仍按原顺序投递**。
+  不再重试、不入死信。**订阅暂停或停用后其投递不再被认领**：撤销时已过期的
+  在途投递（僵死 Worker、租约到期后才撤销）由独立于认领的清理
+  （取消请求返回后立即清理一次 + api/worker 后台巡检）**无需认领即转
+  `cancelled` 并清除租约**，不会再以 `in_flight` 滞留；清理只动 pending 与
+  已过租约的在途投递，不新增尝试/重试，未过期在途请求的成功结算不受影响，
+  旧租约令牌的迟到回写被令牌栅栏与终态守卫挡住。撤销后该事件的**死信重放被
+  拒绝（409）**；已有成功、死信、每次尝试历史与载荷对象引用全部保留，
+  **其他事件仍按原顺序投递**。
   重复撤销幂等，未知事件 404；撤销后以同一 `source/event_id` 重复提交只
   返回原事件（带 `cancelled_at`），**不复活任何投递**。事件查询返回撤销
   时刻，投递查询展示 `cancelled` 终态。
@@ -311,6 +317,20 @@ HTTP/1.1 404 Not Found
 - 撤销**前已认领（`in_flight`）的 HTTP 请求允许飞完**：目标返回成功仍结算
   为 `succeeded`；请求失败、或其租约已过期被接管，则结算为 `cancelled`，
   **不再退避重试、不进入死信**；
+- **暂停 / 停用订阅下租约已过期的在途投递无需认领即转 `cancelled`**：撤销
+  事务只终结 `pending`（其与认领经订阅行锁串行），而 `claim_delivery` 只认领
+  `active=TRUE AND paused=FALSE` 的订阅——订阅暂停或停用后，撤销时已经
+  `in_flight` 且租约过期的投递不会再被任何认领事务读到（旧实现因此永久
+  滞留为 `in_flight`）。修复后撤销事务一提交，取消请求即在**同一响应流程内**
+  做一次“无需认领”的清理（`sweep_cancelled_deliveries`）直接把该事件租约
+  已过期的在途投递转 `cancelled` 并清除租约；撤销时租约尚未到期的在途请求
+  保留，等其成功结算或租约到期后由 **api/worker 后台巡检**（间隔
+  `CANCEL_SWEEP_INTERVAL_SECONDS`，默认 1s）清理；
+- 清理**不做认领、不产生租约、不新增尝试记录**，重复运行幂等（终态行命中
+  0 行）；清理只锁投递行（`FOR UPDATE SKIP LOCKED`），正被 `record_attempt`
+  /`settle_delivery` 持锁的行本轮跳过、下轮再清，不与任何事务成环；旧租约
+  令牌的迟到回写被租约令牌栅栏 + `in_flight` 状态守卫挡住，**终态绝不会被
+  覆盖**；
 - 已是 `succeeded` / `dead_lettered` 的投递、每次尝试历史（attempts）、事件
   载荷及其对象存储引用**全部原样保留**（撤销不删载荷，可继续在 MinIO 桶中
   浏览）；`cancelled` 是终态，不阻挡同订阅后续事件——**其他事件严格顺序不变**；
@@ -415,6 +435,82 @@ HTTP/1.1 409 Conflict
 {"detail":"事件已撤销，其死信不允许重放"}
 ```
 
+#### 暂停订阅上租约已过期的在途投递（滞留修复示例）
+
+订阅暂停后其投递不会再被 Worker 认领。若撤销时该投递正被一个僵死 Worker
+以**已过期租约**持有（`in_flight`），修复前取消只终结 `pending`，该投递会
+一直以 `in_flight` 滞留在 `GET /events/{id}/deliveries` 中；修复后取消请求
+返回的同一流程即把它清理为 `cancelled`（无需认领、无新增尝试、清除租约）。
+
+下面用暂停订阅复现（过期租约一般出现在 Worker 宕机场景，可用 psql 把投递
+置为 `in_flight` 且 `lease_expires_at < now()` 模拟）：
+
+```bash
+# 1) 订阅指向接收器并暂停
+$ curl -s -X POST localhost:8000/api/v1/subscriptions \
+    -H 'Content-Type: application/json' \
+    -d '{"source":"orders","target_url":"http://receiver:8001/receive",
+         "secret":"dev-signing-secret"}'
+{"id":5,"source":"orders","target_url":"http://receiver:8001/receive",
+ "active":true,"paused":false, …}
+$ curl -s -X POST localhost:8000/api/v1/subscriptions/5/pause
+{"id":5, …,"paused":true,"paused_at":"2026-10-06T00:02:33.812155Z", …}
+
+# 2) 提交事件：暂停期间仍建 pending 投递
+$ curl -s -X POST localhost:8000/api/v1/events \
+    -H 'Content-Type: application/json' \
+    -d '{"source":"orders","event_id":"ord-stuck-expired","payload":{"z":1}}'
+{"id":4, …, "cancelled_at":null,"duplicate":false}
+
+# 3) 模拟僵死 Worker 的过期租约（LEASE_SECONDS=30，已过去 40s）
+#    psql -d webhooks -c "UPDATE deliveries SET status='in_flight',
+#      leased_by='dead-worker', leased_at=now()-interval '40 seconds',
+#      lease_expires_at=now()-interval '10 seconds' WHERE id=14;"
+
+# 4) 撤销：响应成功后该过期在途投递立即终态、租约清空（无需恢复订阅/认领）
+$ curl -s -X POST localhost:8000/api/v1/events/4/cancel
+{"id":4,"source":"orders","event_id":"ord-stuck-expired",
+ "payload_digest":"9d80fd5b8b1e66e0eb1a8f15644749bbdcb6304691b9d3de20aa4010cdac2bc1",
+ "created_at":"2026-10-06T00:02:33.822721Z",
+ "cancelled_at":"2026-10-06T00:02:33.845578Z"}
+
+$ curl -s localhost:8000/api/v1/deliveries/14 | python3 -m json.tool
+{
+    "id": 14,
+    "event_id_fk": 4,
+    "subscription_id": 5,
+    "event_source": "orders",
+    "source_event_id": "ord-stuck-expired",
+    "target_url": "http://receiver:8001/receive",
+    "config_version_id": 5,
+    "config_revision": 1,
+    "config_effective_at": "2026-10-06T00:02:33.812155Z",
+    "chain_id": 14,
+    "chain_seq": 1,
+    "status": "cancelled",
+    "attempts_made": 0,
+    "not_before": "2026-10-06T00:02:33.848239Z",
+    "leased_at": null,
+    "lease_expires_at": null,
+    "leased_by": null,
+    "created_at": "2026-10-06T00:02:33.822721Z",
+    "updated_at": "2026-10-06T00:02:33.848239Z"
+}
+```
+
+若撤销时该在途投递的租约**尚未过期**（Worker 仍可能飞完请求），取消请求
+不会动它——响应里仍为 `in_flight` 且租约保留；它要么成功结算为
+`succeeded`，要么在租约到期后由后台巡检（默认 1s）转为 `cancelled`：
+
+```bash
+# 撤销时租约未过期：仍 in_flight、leased_by 保留
+{"status": "in_flight", "leased_by": "dead-worker-expiring", …}
+# 约 2s（租约到期 + 巡检间隔）后
+$ curl -s localhost:8000/api/v1/deliveries/20 | python3 -c \
+  'import json,sys; d=json.load(sys.stdin); print(d["status"], d["leased_by"], d["attempts_made"])'
+cancelled None 0
+```
+
 #### 撤销边界如何与认领 / 结算 / 重放串行
 
 撤销需要同时约束四类写操作，统一的加锁方向为
@@ -437,6 +533,24 @@ HTTP/1.1 409 Conflict
   的 pending 链记录会被随后的撤销一并翻转，旧死信记录保留；
 - **租约过期接管**本质是一条新的认领事务，同样被撤销复核拦截——过期
   `in_flight` 不会被重新投递，而是直接转 `cancelled`（不新增尝试记录）。
+- **暂停 / 停用订阅的过期在途投递（认领不可达，关键修复）**：认领候选查询
+  过滤 `s.active=TRUE AND s.paused=FALSE`，订阅暂停或停用后其投递永远不会
+  再被认领事务读到，上面“接管即翻转”的路径对它们不可达。修复新增了一条
+  **独立于认领**的清理原语 `sweep_cancelled_deliveries`：只把“事件已撤销”的
+  `pending` 与租约已过期 `in_flight` 投递转 `cancelled` 并清租约（认领复核
+  `_claim_cancel_candidate` 复用同一集合）。它在两处运行：
+  1. `POST /events/{id}/cancel` 事务提交后的**同请求清理**（按事件，确定性
+     立即生效）；
+  2. api 与 worker 进程的**后台巡检**（全库，默认每 1s；处理撤销时租约尚未
+     到期、随后 Worker 僵死的情形）。
+
+  清理只锁 `deliveries` 行（`FOR UPDATE SKIP LOCKED`），不取订阅/事件行锁，
+  因而与撤销/认领/结算/重放都不构成等待环：正被 `record_attempt` 或
+  `settle_delivery` 持锁的行本轮跳过、下轮再清。终态行与未过期在途请求都不
+  在集合内——撤销前已认领且仍在租约窗口的请求照常飞行并可结算为
+  `succeeded`；清理一旦把过期在途投递转为 `cancelled`，僵死 Worker 的迟到
+  回写在 `record_attempt`/`settle_delivery` 上同时被“租约令牌不符”和“行已
+  非 `in_flight`”两道守卫拒绝，**旧租约令牌绝不能新增尝试或覆盖终态**。
 
 ## API 一览
 
@@ -1188,6 +1302,7 @@ WEBHOOK_ALLOWED_HOSTS=receiver,127.0.0.1,localhost docker compose up --build
 | `LEASE_SECONDS` | `30` | 认领租约时长；过期可被接管 |
 | `HTTP_TIMEOUT_SECONDS` | `10` | 单次投递 HTTP 超时（应小于租约） |
 | `WORKER_POLL_SECONDS` | `1` | 无任务时 Worker 轮询间隔 |
+| `CANCEL_SWEEP_INTERVAL_SECONDS` | `1` | 已撤销事件滞留投递（暂停/停用订阅下租约过期的在途投递）后台清理巡检间隔；取消请求返回后也会立即清理一次 |
 | `MAX_ATTEMPTS` | `6` | 最大尝试次数，达到后进死信；仅作新建订阅 revision=1 的默认值，发布版本可按订阅覆盖 |
 | `BACKOFF_BASE_SECONDS` | `5` | 指数退避基数：`base*2^(n-1)`；同上，可被版本覆盖 |
 | `BACKOFF_CAP_SECONDS` | `300` | 退避间隔上限；同上，可被版本覆盖 |

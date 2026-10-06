@@ -58,6 +58,13 @@ async def _init_connection(conn: asyncpg.Connection) -> None:
 #   事件的新租约；撤销前已认领（in_flight）的请求可完成——成功仍记
 #   succeeded，失败（settle 在事件行锁复核到撤销）或租约过期（认领路径
 #   复核到撤销）一律转 cancelled，不再重试、不入死信；
+# - 暂停/停用订阅的滞留投递由独立于认领的 sweep_cancelled_deliveries
+#   终结：claim_delivery 只认领 active 且非暂停订阅的投递，订阅暂停/停用
+#   后撤销时租约已过期的 in_flight 不会再被认领事务访问，取消请求返回后
+#   立即按事件清理一次、api/worker 后台巡检全库兜底——直接转 cancelled 并
+#   清除租约（不产生租约、不新增尝试）；未过期的在途请求不在清理集合，
+#   成功仍记 succeeded；旧租约令牌的迟到回写被 record_attempt/settle 的
+#   leased_by 令牌栅栏与 in_flight 状态守卫挡住，不覆盖终态；
 # - pending 翻转用 FOR UPDATE SKIP LOCKED 跳过正被并发认领持锁的行：
 #   该认领到订阅行锁后复核事件已撤销，会自行放弃租约并把候选行翻转，
 #   因而撤销 UPDATE 不会与认领形成锁等待环；

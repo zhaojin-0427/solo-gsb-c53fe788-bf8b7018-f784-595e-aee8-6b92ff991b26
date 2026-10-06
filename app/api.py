@@ -215,8 +215,11 @@ async def cancel_event(event_pk: int) -> CancelEventOut:
     pending 投递置为终态 `cancelled`。响应成功返回后 Worker 不会再为该事件
     产生新租约（撤销与认领经订阅行锁串行）：撤销前已认领（in_flight）的
     请求仍可完成——成功仍记 `succeeded`；失败或租约过期则转 `cancelled`，
-    不再重试、不入死信。撤销后该事件的死信重放被拒绝（409）；已有成功、
-    死信、尝试历史与载荷对象引用全部保留；其他事件仍按原顺序投递。
+    不再重试、不入死信。撤销事务提交后立即执行一次**无需认领**的清理，
+    把该事件租约已过期的在途投递（含暂停/停用订阅下永不会再被认领而滞留
+    的投递）直接转 `cancelled` 并清除租约；未过期的在途请求不在清理集合。
+    撤销后该事件的死信重放被拒绝（409）；已有成功、死信、尝试历史与载荷
+    对象引用全部保留；其他事件仍按原顺序投递。
 
     重复撤销幂等（返回同一 `cancelled_at`，HTTP 200）；未知事件返回 404。
     撤销后以同一 `(source, event_id)` 重复提交事件不会复活投递（返回原事件，
@@ -225,6 +228,12 @@ async def cancel_event(event_pk: int) -> CancelEventOut:
     pool = get_pool()
     async with pool.acquire() as conn:
         row = await repo.cancel_event(conn, event_pk)
+        if row is not None:
+            # 撤销事务已提交：立即做一次“无需认领”的确定性清理——把该事件
+            # 租约已过期的 in_flight（含暂停/停用订阅下永不会再被认领的
+            # 滞留投递）直接转 cancelled 并清除租约。未过期的在途请求不动，
+            # 仍可成功结算为 succeeded。
+            await repo.sweep_cancelled_deliveries(conn, event_pk=event_pk)
     if row is None:
         raise HTTPException(status_code=404, detail="事件不存在")
     return CancelEventOut(
