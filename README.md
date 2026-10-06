@@ -33,16 +33,19 @@
   次数继续；严格顺序、死信重放语义不变。订阅查询（详情/列表）返回暂停状态。
   详见下文[“订阅暂停与恢复”](#订阅暂停与恢复)。
 - **事件撤销（cancel）**：`POST /api/v1/events/{id}/cancel` 在单事务内原子
-  标记撤销时刻（`cancelled_at`）并把该事件各订阅的 **pending 投递置为终态
-  `cancelled`**。撤销响应成功后 Worker 绝不会再为该事件产生新租约（撤销与
-  认领按“事件行 → 订阅行 → 投递行”锁序串行）；撤销前**已认领（in_flight）
-  的请求仍可完成**——成功仍记 `succeeded`，失败或租约过期则转 `cancelled`，
-  不再重试、不入死信。撤销后该事件的**死信重放被拒绝（409）**；已有成功、
-  死信、每次尝试历史与载荷对象引用全部保留，**其他事件仍按原顺序投递**。
-  重复撤销幂等，未知事件 404；撤销后以同一 `source/event_id` 重复提交只
-  返回原事件（带 `cancelled_at`），**不复活任何投递**。事件查询返回撤销
-  时刻，投递查询展示 `cancelled` 终态。
-  详见下文[“事件撤销”](#事件撤销)。
+  标记撤销时刻（`cancelled_at`）并把该事件各订阅的 **pending 投递与租约
+  已过期的 in_flight 投递置为终态 `cancelled`**（清除租约字段）。撤销响应
+  成功后 Worker 绝不会再为该事件产生新租约（撤销与认领按“事件行 → 订阅
+  行 → 投递行”锁序串行）；撤销前**已认领且租约未过期（in_flight）的请求
+  仍可完成**——成功仍记 `succeeded`，失败则转 `cancelled`，不再重试、不入
+  死信。撤销后才过期的在飞投递由 Worker 每轮认领事务内的**过期清理**终结
+  （不经过候选选择，**暂停/停用订阅下同样生效**），投递查询不会滞留
+  `in_flight`；清理幂等、不新增尝试记录，旧租约令牌的回写不会覆盖终态。
+  撤销后该事件的**死信重放被拒绝（409）**；已有成功、死信、每次尝试历史
+  与载荷对象引用全部保留，**其他事件仍按原顺序投递**。重复撤销幂等，未知
+  事件 404；撤销后以同一 `source/event_id` 重复提交只返回原事件（带
+  `cancelled_at`），**不复活任何投递**。事件查询返回撤销时刻，投递查询
+  展示 `cancelled` 终态。详见下文[“事件撤销”](#事件撤销)。
 - **HMAC 签名**：每次投递携带时间戳签名头
   `X-Webhook-Signature: t=<unix秒>,v1=<HMAC-SHA256 hex>`，签名内容为
   `<timestamp>.<紧凑排序 JSON 载荷>`；密钥取自该投递钉住的配置版本。
@@ -303,14 +306,22 @@ HTTP/1.1 404 Not Found
 
 `POST /api/v1/events/{event_pk}/cancel` 撤销一个事件（无需请求体）。仓储在
 **单事务**内完成：给事件行写入撤销时刻 `events.cancelled_at`，并把该事件在
-各订阅上仍是 `pending`（等待/退避中）的投递原子翻转为终态 `cancelled`。
+各订阅上仍是 `pending`（等待/退避中）的投递、以及租约**已过期**的
+`in_flight` 投递，原子翻转为终态 `cancelled`（同时清除租约字段）。
 
 行为约定：
 
 - **撤销响应成功后，Worker 绝不会再为该事件产生新租约**（含过期租约接管）；
-- 撤销**前已认领（`in_flight`）的 HTTP 请求允许飞完**：目标返回成功仍结算
-  为 `succeeded`；请求失败、或其租约已过期被接管，则结算为 `cancelled`，
+- 撤销**前已认领且租约未过期（`in_flight`）的 HTTP 请求允许飞完**：目标
+  返回成功仍结算为 `succeeded`；请求失败则结算为 `cancelled`，
   **不再退避重试、不进入死信**；
+- **过期在飞投递不滞留**：撤销时刻租约已过期的 `in_flight` 投递随撤销事务
+  直接终结；撤销后才过期的，由 Worker 每轮认领事务内的**过期清理**终结为
+  `cancelled` 并清除租约——清理不经过认领的候选选择（候选选择会过滤暂停/
+  停用订阅），因此**暂停或停用订阅下 worker 未结算的过期在飞投递同样会被
+  终结**，`GET /api/v1/events/{id}/deliveries` 不会长期滞留 `in_flight`。
+  清理幂等：不新增尝试记录、不改变 `attempts_made`、重复执行无副作用；
+  清理后旧租约令牌的回写（记录尝试/结算）被租约栅栏作废，不覆盖终态；
 - 已是 `succeeded` / `dead_lettered` 的投递、每次尝试历史（attempts）、事件
   载荷及其对象存储引用**全部原样保留**（撤销不删载荷，可继续在 MinIO 桶中
   浏览）；`cancelled` 是终态，不阻挡同订阅后续事件——**其他事件严格顺序不变**；
@@ -415,9 +426,93 @@ HTTP/1.1 409 Conflict
 {"detail":"事件已撤销，其死信不允许重放"}
 ```
 
-#### 撤销边界如何与认领 / 结算 / 重放串行
+#### 过期在飞投递的终结（暂停/停用订阅下不再滞留 `in_flight`）
 
-撤销需要同时约束四类写操作，统一的加锁方向为
+Worker 认领投递后宕机/失联且租约到期时，该投递处于“`in_flight` + 过期
+租约”。若订阅随后被暂停（或停用），此类投递永远不会被认领接管（认领的
+候选选择会过滤暂停/停用订阅）——撤销该事件时，仓储在撤销事务内把
+**租约已过期的 in_flight 投递一并终结**；撤销时租约尚未过期的，到期后由
+Worker 每轮认领事务内的过期清理终结（不经过候选选择，暂停/停用订阅同样
+生效）。两条路径都不新增尝试记录、清除租约字段，因此投递查询不会长期
+滞留 `in_flight`：
+
+```bash
+# 前提：订阅已暂停（POST /subscriptions/3/pause），其投递 21 被某 Worker
+# 认领后该 Worker 失联，租约已过期（查询显示 in_flight + 过期 lease_expires_at）
+$ curl -s localhost:8000/api/v1/events/9/deliveries | python3 -m json.tool
+[
+    {
+        "id": 21,
+        "event_id_fk": 9,
+        "subscription_id": 3,
+        "event_source": "orders",
+        "source_event_id": "evt-1009",
+        "target_url": "http://receiver:8001/receive",
+        "config_version_id": 3,
+        "config_revision": 1,
+        "config_effective_at": "2026-10-05T11:00:00.000000Z",
+        "chain_id": 21,
+        "chain_seq": 1,
+        "status": "in_flight",
+        "attempts_made": 0,
+        "not_before": "2026-10-05T11:00:00.000000Z",
+        "leased_at": "2026-10-05T11:00:01.000000Z",
+        "lease_expires_at": "2026-10-05T11:00:31.000000Z",
+        "leased_by": "worker-7f3a:1759658401.123",
+        "created_at": "2026-10-05T11:00:00.000000Z",
+        "updated_at": "2026-10-05T11:00:01.000000Z"
+    }
+]
+
+# 撤销：过期在飞投递随撤销事务一并终结（无需等待任何认领）
+$ curl -s -X POST localhost:8000/api/v1/events/9/cancel | python3 -m json.tool
+{
+    "id": 9,
+    "source": "orders",
+    "event_id": "evt-1009",
+    "payload_digest": "3a6eb0790f39ac87c94f3856b2dd2c5d110e6811602261a9a923d3bb23adc8b7",
+    "created_at": "2026-10-05T11:00:00.000000Z",
+    "cancelled_at": "2026-10-05T11:02:00.456789Z"
+}
+
+# 再次查询：终态 cancelled，租约字段已清空，不新增尝试记录
+$ curl -s localhost:8000/api/v1/events/9/deliveries | python3 -m json.tool
+[
+    {
+        "id": 21,
+        "event_id_fk": 9,
+        "subscription_id": 3,
+        "event_source": "orders",
+        "source_event_id": "evt-1009",
+        "target_url": "http://receiver:8001/receive",
+        "config_version_id": 3,
+        "config_revision": 1,
+        "config_effective_at": "2026-10-05T11:00:00.000000Z",
+        "chain_id": 21,
+        "chain_seq": 1,
+        "status": "cancelled",
+        "attempts_made": 0,
+        "not_before": "2026-10-05T11:02:00.456789Z",
+        "leased_at": null,
+        "lease_expires_at": null,
+        "leased_by": null,
+        "created_at": "2026-10-05T11:00:00.000000Z",
+        "updated_at": "2026-10-05T11:02:00.456789Z"
+    }
+]
+
+$ curl -s localhost:8000/api/v1/deliveries/21/attempts
+[]
+```
+
+若撤销时租约尚未过期（在飞请求仍可能成功），投递保持 `in_flight` 不动；
+待租约到期后，任一存活 Worker 的下一轮认领事务即把它终结为 `cancelled`
+（清理幂等，重复执行不新增尝试、不重试）。旧租约令牌迟到的回写（记录
+尝试/结算）会被 `leased_by = NULL` 栅栏作废，不会覆盖 `cancelled` 终态。
+
+#### 撤销边界如何与认领 / 结算 / 清理 / 重放串行
+
+撤销需要同时约束五类写操作，统一的加锁方向为
 **事件行（`events FOR UPDATE`）→ 订阅行（`subscriptions FOR UPDATE`，按 id
 排序）→ 投递行（`deliveries FOR UPDATE`）**，沿同一方向加锁不会成环：
 
@@ -427,11 +522,22 @@ HTTP/1.1 409 Conflict
   候选（连同该事件其余 pending / 过期 `in_flight` 投递）翻转成 `cancelled`；
   认领先提交则租约已落库，撤销随后才拿订阅行锁——撤销响应在租约之后，该
   请求属于“撤销前已认领”。因此**撤销响应成功与最后一条新租约之间有确定
-  先后**。撤销翻转 pending 行时用 `FOR UPDATE SKIP LOCKED` 跳过正被并发
-  认领持锁的行（该行由认领复核自行翻转），两边不形成锁等待环；
+  先后**。撤销翻转投递行时用 `FOR UPDATE SKIP LOCKED` 跳过正被并发认领/
+  结算持锁的行（被跳过的行由认领复核自行翻转、或由随后的清理终结），
+  两边不形成锁等待环；
 - **撤销 ↔ 结算**：结算按“投递行 → 事件行”加锁，事件行锁与撤销互斥：
   撤销先提交时，失败结算读到事件已撤销即落 `cancelled`（不退避/不重试/
   不入死信），成功结算不受影响仍记 `succeeded`；
+- **过期清理 ↔ 撤销 / 结算 / 认领**：每次认领事务开头先执行过期清理
+  （`sweep_expired_cancelled_in_flight`），把“事件已撤销 + 租约已过期”的
+  `in_flight` 投递终结为 `cancelled` 并清除租约。清理只锁投递行
+  （`FOR UPDATE SKIP LOCKED`），对事件撤销状态做非加锁快照读，不锁事件行/
+  订阅行，与任何路径都不构成等待环；被并发结算/认领持锁的行本轮跳过、
+  下轮再清。清理不经过认领的候选选择，因此**暂停/停用订阅下永远不会被
+  选中接管的过期在飞投递也被终结**（这正是“投递查询不滞留 `in_flight`”
+  的保证）；清理与记录尝试/结算的交错由租约栅栏裁决——清理先提交则旧
+  租约令牌的回写读到 `leased_by = NULL` 即作废（不新增尝试、不覆盖终态），
+  回写先提交则尝试历史保留、清理随后仍把该过期行翻转；
 - **撤销 ↔ 死信重放**：重放先锁死信投递行、再锁其事件行复核，事件已撤销
   一律拒绝（`event_cancelled` → 409），不产生新链记录；重放先提交则其新建
   的 pending 链记录会被随后的撤销一并翻转，旧死信记录保留；
@@ -446,7 +552,7 @@ HTTP/1.1 409 Conflict
 | --- | --- | --- |
 | POST | `/events` | 提交/幂等提交事件；首次 201，重复 200 |
 | GET | `/events/{id}` | 查询事件（撤销后返回 `cancelled_at`） |
-| POST | `/events/{id}/cancel` | 撤销事件（幂等；pending 投递原子转 `cancelled`；未知事件 404） |
+| POST | `/events/{id}/cancel` | 撤销事件（幂等；pending 与已过期 in_flight 投递原子转 `cancelled`；未知事件 404） |
 | GET | `/events/{id}/deliveries` | 事件对应的所有投递（展示 `cancelled` 终态） |
 | POST | `/subscriptions` | 注册订阅（同 source+URL 重复注册为重新激活；同时生成 revision=1） |
 | GET | `/subscriptions?source=` | 列出订阅（含 `current_revision`，不含密钥） |
@@ -468,8 +574,8 @@ HTTP/1.1 409 Conflict
 
 投递状态：`pending`（等待/退避中）、`in_flight`（已被 Worker 认领）、
 `succeeded`、`dead_lettered`、`cancelled`（事件撤销后的终态：撤销时仍
-pending，或撤销后在途请求失败/租约过期）。`/deliveries?status=cancelled`
-可按终态过滤。
+pending 或租约已过期，或撤销后在途请求失败/租约到期被清理）。
+`/deliveries?status=cancelled` 可按终态过滤。
 
 尝试结果（`outcome`）：`success`、`http_error`、`network_error`、`timeout`、
 `security_blocked`（出站安全策略拒绝）、`crypto_error`（订阅密钥不可用）、

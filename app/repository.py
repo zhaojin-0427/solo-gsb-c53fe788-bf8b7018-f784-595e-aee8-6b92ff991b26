@@ -646,15 +646,15 @@ async def get_event(
 
 # -- 事件撤销 --------------------------------------------------------------------
 #
-# 撤销 / 认领 / 结算 / 死信重放的锁顺序与状态检查（关键不变式）：
+# 撤销 / 认领 / 结算 / 清理 / 死信重放的锁顺序与状态检查（关键不变式）：
 #
 # 统一锁序（沿同一方向加锁，数学上不可能成环）：
 #   事件行(events FOR UPDATE) → 订阅行(subscriptions FOR UPDATE)
 #                             → 投递行(deliveries FOR UPDATE [SKIP LOCKED])
 #
 # - cancel_event 严格按此顺序：先锁事件行（撤销的权威裁决点），再按 id 排序
-#   锁相关订阅行，最后翻转投递。重复撤销在事件行上读到 cancelled_at 已非空
-#   即幂等返回（不刷新时间戳）。
+#   锁相关订阅行，最后翻转投递（pending 与租约已过期的 in_flight）。重复撤销
+#   在事件行上读到 cancelled_at 已非空即幂等返回（不刷新时间戳）。
 # - 认领（claim_delivery）只持有“投递行 → 订阅行”锁（不锁事件行），因此
 #   事件是否已撤销用非加锁快照读判定（_claim_event_cancelled）：该读在
 #   READ COMMITTED 下取语句开始时最新已提交版本，结合订阅行锁提供的
@@ -667,9 +667,13 @@ async def get_event(
 # - 结算（settle_delivery）按“投递行 → 事件行”加锁。事件行 FOR UPDATE 与
 #   cancel_event 的事件行锁互斥，决定失败尝试的归属：撤销先提交则失败
 #   （或租约过期后的接管结算）→ cancelled，不再退避/重试/死信；成功不受
-#   影响仍记 succeeded。cancel_event 翻转 pending 行时用 SKIP LOCKED 跳过
-#   正被结算持锁的行（结算持有的必是 in_flight 行，本就不在翻转集合），
+#   影响仍记 succeeded。cancel_event 翻转投递行时用 SKIP LOCKED 跳过正被
+#   结算/认领持锁的行（被跳过的过期 in_flight 行随后由清理路径终结），
 #   两者不构成等待环。
+# - 清理（sweep_expired_cancelled_in_flight）只锁投递行（SKIP LOCKED），
+#   对事件撤销状态做非加锁快照读，不锁事件行/订阅行，与上述任何路径都
+#   不构成等待环；它终结“已撤销事件 + 租约已过期”的 in_flight 行，
+#   不经过认领的候选选择，因此暂停/停用订阅下的滞留行同样被清理。
 # - 死信重放（replay_dead_letter）先锁死信投递行，再锁其事件行复核：
 #   已撤销事件一律拒绝重放（event_cancelled），不产生新链 pending 记录，
 #   旧成功/死信/尝试历史与载荷引用全部保留。
@@ -679,6 +683,18 @@ async def get_event(
 # 认领先提交则租约在撤销响应之前已落库（撤销在其后才拿订阅行锁），即
 # “撤销前已认领”，不违反承诺。过期租约接管是一条新的认领事务，同样被
 # 复核拦截，候选直接转 cancelled，绝不重新投递。
+#
+# “过期在飞投递不滞留 in_flight”的论证（暂停/停用订阅同样成立）：
+# 认领的候选选择会过滤暂停/停用订阅，其过期 in_flight 行永远不会被选中
+# 接管；为此存在两条不经过候选选择的终结路径——
+#   1. cancel_event 在撤销事务内直接翻转“撤销时刻租约已过期”的 in_flight
+#      行（未过期行不动：撤销前已认领的请求继续飞行，成功仍记 succeeded）；
+#   2. sweep_expired_cancelled_in_flight 在每次认领事务开头清理“撤销后才
+#      过期”的 in_flight 行（Worker 每轮轮询都执行，不看订阅 active/paused）。
+# 清理与 record_attempt/settle_delivery 的交错由租约栅栏裁决：清理先提交
+# 则旧租约令牌的回写读到 leased_by=NULL 即作废（不新增尝试、不覆盖终态）；
+# 回写先提交则尝试历史保留，清理随后仍把该过期行翻转为 cancelled。清理
+# 本身幂等：不插入尝试记录、不改 attempts_made、重复执行不再命中。
 
 
 async def cancel_event(
@@ -687,14 +703,19 @@ async def cancel_event(
     """原子撤销事件（单事务）；事件不存在返回 None，重复撤销幂等。
 
     锁序：事件行 → 相关订阅行（按 id 排序）→ 投递行。
-    - 首次撤销：cancelled_at=now()，并把该事件全部 pending 投递翻转为
-      cancelled（终态，不阻挡同订阅其他事件的顺序）；
+    - 首次撤销：cancelled_at=now()，并把该事件全部 pending 投递与租约已过期
+      的 in_flight 投递翻转为 cancelled（终态，不阻挡同订阅其他事件的顺序）。
+      过期 in_flight 在此直接终结（无需等待认领/清理），因此暂停或停用订阅
+      下“worker 未结算且租约已到期”的投递不会滞留 in_flight；
     - 重复撤销：时间戳与投递状态保持不变（幂等，不刷新 cancelled_at）；
-    - in_flight 投递不在翻转集合：撤销前已认领的请求继续飞行，其结算在
-      事件行锁复核处裁决（成功→succeeded，失败/租约过期→cancelled）。
-      对 pending 行的 UPDATE 使用 SKIP LOCKED：正被并发认领持锁的候选行
-      由该认领导订阅行、复核撤销后自行翻转，这里不等待，避免与认领形成
-      锁等待环。
+    - 租约未过期的 in_flight 投递不在翻转集合：撤销前已认领且仍在租约内的
+      请求继续飞行，其结算在事件行锁复核处裁决（成功→succeeded，失败→
+      cancelled）；撤销后才过期的 in_flight 行由清理路径
+      （sweep_expired_cancelled_in_flight，随每次认领事务执行，不看订阅
+      暂停/停用状态）终结为 cancelled 并清除租约。
+      对投递行的 UPDATE 使用 SKIP LOCKED：正被并发认领/结算持锁的行由该
+      认领/结算自身的撤销复核（或随后的清理）终结，这里不等待，避免与
+      认领/结算形成锁等待环。
     """
     async with conn.transaction():
         event = await conn.fetchrow(
@@ -728,7 +749,11 @@ async def cancel_event(
             """
             WITH locked AS (
                 SELECT id FROM deliveries
-                WHERE event_id_fk = $1 AND status = 'pending'
+                WHERE event_id_fk = $1
+                  AND (
+                        status = 'pending'
+                     OR (status = 'in_flight' AND lease_expires_at < now())
+                  )
                 FOR UPDATE SKIP LOCKED
             )
             UPDATE deliveries d
@@ -804,9 +829,69 @@ async def _claim_cancel_candidate(
     )
 
 
+# 单次认领事务内清理的过期在飞行投递上限：批量足够大以跟上滞留速度，
+# 又避免偶发大量滞留时认领事务过长（剩余行下一轮轮询继续清理）。
+_SWEEP_EXPIRED_LIMIT = 200
+
+
+async def sweep_expired_cancelled_in_flight(
+    conn: asyncpg.Connection, *, limit: int = _SWEEP_EXPIRED_LIMIT
+) -> int:
+    """把“事件已撤销且租约已过期”的 in_flight 投递终结为 cancelled。
+
+    返回本次翻转的行数。这是过期在飞投递的兜底终结路径，**不经过认领的
+    候选选择**（候选选择会过滤暂停/停用订阅，其过期行永远不会被选中接管），
+    因此暂停或停用订阅下“worker 未结算且租约已到期”的投递也能转 cancelled
+    并清除租约，不会在投递查询中长期滞留 in_flight。
+
+    - 只锁投递行（FOR UPDATE SKIP LOCKED），对 events.cancelled_at 做非加锁
+      快照读，不锁事件行/订阅行：与撤销（事件→订阅→投递）、结算（投递→
+      事件）、认领（投递→订阅）都不构成锁等待环；被并发结算/认领持锁的行
+      本轮跳过，下一轮再清；
+    - 只翻转 lease_expires_at < now() 的行：租约未过期的在飞请求不受影响，
+      其成功结算仍记 succeeded；
+    - 与 record_attempt/settle_delivery 的交错由租约栅栏裁决：清理先提交
+      则旧租约令牌的回写读到 leased_by=NULL 即作废（返回 None，不新增
+      尝试、不覆盖 cancelled 终态）；回写先提交则尝试历史保留，清理随后
+      仍把该过期行翻转为 cancelled；
+    - 幂等：不插入 delivery_attempts、不改 attempts_made、不产生新租约、
+      不翻回 pending；重复执行时行已是 cancelled 不再命中，返回 0。
+    """
+    async with conn.transaction():
+        result = await conn.execute(
+            """
+            WITH locked AS (
+                SELECT d.id
+                FROM deliveries d
+                JOIN events e ON e.id = d.event_id_fk
+                WHERE d.status = 'in_flight'
+                  AND d.lease_expires_at < now()
+                  AND e.cancelled_at IS NOT NULL
+                ORDER BY d.id
+                LIMIT $1
+                FOR UPDATE OF d SKIP LOCKED
+            )
+            UPDATE deliveries d
+            SET status = 'cancelled',
+                not_before = now(),
+                leased_at = NULL,
+                lease_expires_at = NULL,
+                leased_by = NULL,
+                updated_at = now()
+            FROM locked
+            WHERE d.id = locked.id
+            """,
+            limit,
+        )
+    return int(result.split()[-1])
+
+
 # -- Worker：认领队首任务 --------------------------------------------------------
 
 # 严格顺序的关键：
+# 0) 同事务先执行过期在飞清理（sweep_expired_cancelled_in_flight）：把“已撤销
+#    事件 + 租约已过期”的 in_flight 投递直接终结为 cancelled 并清除租约——
+#    不经过下面的候选选择，因此暂停/停用订阅下的滞留行也被清理；
 # 1) 先在事务中锁定该订阅“可投递且 seq 最小”的那一条（FOR UPDATE SKIP LOCKED）；
 # 2) 检查它前面是否还有未终结的投递，有则跳过（保证前一事件成功或进死信后才动）；
 # 3) 锁定投递所属的 subscriptions 行并复核 paused/active——暂停状态的写入
@@ -910,6 +995,13 @@ async def claim_delivery(
     lease_token = f"{worker_id}:{now.timestamp()}"
 
     async with conn.transaction():
+        # 先兜底终结“已撤销事件 + 租约已过期”的 in_flight 投递（同事务）：
+        # 候选选择会过滤暂停/停用订阅，其过期行永远不会被选中接管，必须在
+        # 认领之前不经候选选择地清理，否则撤销事件在暂停/停用订阅下的过期
+        # 在飞投递会永远滞留 in_flight。清理与后续认领同事务，被清理的行
+        # （已 cancelled）不会再成为本轮候选。
+        await sweep_expired_cancelled_in_flight(conn)
+
         candidate = await _claim_select_candidate(conn, now)
         if candidate is None:
             return None

@@ -52,15 +52,23 @@ async def _init_connection(conn: asyncpg.Connection) -> None:
 # 事件撤销（events.cancelled_at + deliveries.status='cancelled'，见
 # repository.cancel_event）：
 # - 撤销在单事务内给事件行打 cancelled_at 时间戳，并把该事件全部 pending
-#   投递原子置为终态 cancelled；succeeded/dead_lettered 历史与尝试记录保留；
+#   投递与租约已过期的 in_flight 投递原子置为终态 cancelled；
+#   succeeded/dead_lettered 历史与尝试记录保留；
 # - 撤销事务先锁事件行、再按 id 顺序锁相关订阅行（与认领事务的“投递行→
 #   订阅行”次序构成确定先后，同暂停边界）：撤销响应成功后不可能再产生该
-#   事件的新租约；撤销前已认领（in_flight）的请求可完成——成功仍记
-#   succeeded，失败（settle 在事件行锁复核到撤销）或租约过期（认领路径
-#   复核到撤销）一律转 cancelled，不再重试、不入死信；
-# - pending 翻转用 FOR UPDATE SKIP LOCKED 跳过正被并发认领持锁的行：
+#   事件的新租约；撤销前已认领且租约未过期（in_flight）的请求可完成——
+#   成功仍记 succeeded，失败（settle 在事件行锁复核到撤销）一律转
+#   cancelled，不再重试、不入死信；
+# - 撤销后才过期的 in_flight 投递由清理路径终结
+#   （repository.sweep_expired_cancelled_in_flight，随每次认领事务执行）：
+#   不经过认领的候选选择（候选选择会过滤暂停/停用订阅），因此暂停或停用
+#   订阅下的过期在飞投递同样转 cancelled 并清除租约，不会滞留 in_flight；
+#   清理幂等（不新增尝试、不改 attempts_made），旧租约令牌的回写被
+#   leased_by=NULL 栅栏作废，不覆盖终态；
+# - 投递行翻转用 FOR UPDATE SKIP LOCKED 跳过正被并发认领/结算持锁的行：
 #   该认领到订阅行锁后复核事件已撤销，会自行放弃租约并把候选行翻转，
-#   因而撤销 UPDATE 不会与认领形成锁等待环；
+#   被跳过的过期行随后由清理路径终结，因而撤销 UPDATE 不会与认领/结算
+#   形成锁等待环；
 # - 撤销后该事件的死信重放被拒（replay 锁事件行复核 cancelled_at）；
 #   重复提交同一 (source, event_id) 仍只返回原事件（带 cancelled_at），
 #   不新增/复活任何投递。其他事件的投递顺序不受影响（cancelled 是终态，
@@ -372,6 +380,14 @@ def _schema_statements(
         CREATE INDEX IF NOT EXISTS idx_deliveries_event_status
             ON deliveries (event_id_fk, status)
         """,
+        # 过期在飞清理（sweep_expired_cancelled_in_flight 随每轮认领执行）：
+        # 部分索引只覆盖在飞行（通常很少），按租约到期时刻范围扫描，
+        # 避免每轮认领都全表扫 deliveries。
+        """
+        CREATE INDEX IF NOT EXISTS idx_deliveries_in_flight_lease
+            ON deliveries (lease_expires_at)
+            WHERE status = 'in_flight'
+        """,
         # 旧库升级：deliveries.status 的 CHECK 需纳入 cancelled。旧约束名为
         # Postgres 自动命名（deliveries_status_check），存在则替换；新建库
         # 上面的 CREATE TABLE 已带新约束，DO 块守卫跳过 ADD。
@@ -520,15 +536,28 @@ async def create_pool(dsn: str | None = None) -> asyncpg.Pool:
 async def init_schema(conn: asyncpg.Connection) -> None:
     # 咨询锁串行化多进程（api + 多 worker）启动时的并发 DDL，
     # 避免 IF NOT EXISTS 在 pg_class 上的竞态冲突。
-    async with conn.transaction():
-        await conn.execute("SELECT pg_advisory_xact_lock(91247)")
-        for statement in _schema_statements(
-            settings.max_attempts,
-            settings.backoff_base_seconds,
-            settings.backoff_cap_seconds,
-        ):
-            await conn.execute(statement)
-    log.info("数据库表结构已初始化")
+    # 另一进程可能已完成初始化并进入运行态（认领/清理/恢复等查询持有所需
+    # 表锁），本事务的 ALTER/DROP 类语句（AccessExclusive）与之可能互相等待，
+    # 被 Postgres 判为死锁受害者；全部语句幂等（IF NOT EXISTS / IF EXISTS /
+    # DO 守卫 / 条件回填），回滚后整体重试即可。运行态查询一侧（worker 主
+    # 循环、后台恢复）自带逐轮容错，被判受害者时会自行重试。
+    for attempt in range(5):
+        try:
+            async with conn.transaction():
+                await conn.execute("SELECT pg_advisory_xact_lock(91247)")
+                for statement in _schema_statements(
+                    settings.max_attempts,
+                    settings.backoff_base_seconds,
+                    settings.backoff_cap_seconds,
+                ):
+                    await conn.execute(statement)
+            log.info("数据库表结构已初始化")
+            return
+        except asyncpg.DeadlockDetectedError:
+            if attempt == 4:
+                raise
+            log.warning("表结构初始化与运行态查询死锁，回滚后重试（%s/5）", attempt + 1)
+            await asyncio.sleep(0.2 * (attempt + 1))
 
 
 async def init_db() -> asyncpg.Pool:
